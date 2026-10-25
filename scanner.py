@@ -1,5 +1,5 @@
 """
-NSE Swing Scanner v6 -> Telegram
+NSE Swing Scanner v7 -> Telegram
 Prices : Angel One SmartAPI (official NSE data)
 M.Cap  : AMFI list (amfi_mcap.pdf in this repository)
 MODE=live : during market hours, alerts new setups as they form (provisional)
@@ -43,7 +43,7 @@ MAX_FETCH_LIVE  = 300    # max history downloads in one live run
 
 AMFI_FILE  = "amfi_mcap.pdf"
 CACHE_FILE = "history.pkl.gz"
-PARSER_VER = 2
+PARSER_VER = 3
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 NIFTY, VIX = "NIFTY50", "INDIAVIX"
 NIFTY_TOKEN, VIX_TOKEN = "99926000", "99926017"
@@ -95,6 +95,7 @@ ISIN_RE = re.compile(r"(IN[A-Z0-9]{9}\d)")
 NUM_RE = re.compile(r"^\d[\d,]*(\.\d+)?$")
 CAT_RE = re.compile(r"(Large|Mid|Small)\s*Cap", re.I)
 SYM_RE = re.compile(r"^[A-Z0-9][A-Z0-9&\-\.]*$")
+RANK_RE = re.compile(r"^\s*(\d{1,5})\s")
 
 
 def clean_name(name):
@@ -106,13 +107,25 @@ def to_num(s):
     return float(s.replace(",", ""))
 
 
+def join_split_numbers(tokens):
+    """Re-joins numbers the PDF split into pieces, e.g. '14,4' + '79.51'."""
+    out = []
+    for t in tokens:
+        if out and t[:1].isdigit() and re.fullmatch(r"\d[\d,]*,|\d[\d,]*,\d{1,2}", out[-1]):
+            out[-1] += t
+        else:
+            out.append(t)
+    return out
+
+
 def parse_cells(cells):
-    """One table row -> (nse_symbol, name, avg_mcap) or None."""
+    """One table row -> (nse_symbol, name, avg_mcap, rank) or None."""
     cells = [re.sub(r"\s+", " ", str(c or "")).strip() for c in cells]
     idx = next((i for i, c in enumerate(cells) if ISIN_RE.fullmatch(c.replace(" ", ""))), None)
     if idx is None:
         return None
-    rest = [c.strip("*").strip() for c in cells[idx + 1:]]
+    rest = [c.replace(" ", "").strip("*") if NUM_RE.match(c.replace(" ", "")) else c.strip("*").strip()
+            for c in cells[idx + 1:]]
     nums = [c for c in rest if NUM_RE.match(c)]
     if not nums:
         return None
@@ -124,28 +137,32 @@ def parse_cells(cells):
             return None
         sym = syms[1] if len(syms) >= 2 else syms[0]
     name = cells[idx - 1] if idx >= 1 and cells[idx - 1] else sym
-    return sym, name, to_num(nums[-1])
+    rank = int(cells[0]) if idx >= 2 and cells[0].isdigit() else None
+    return sym, name, to_num(nums[-1]), rank
 
 
 def parse_line(line):
-    """One text line -> (nse_symbol, name, avg_mcap) or None."""
+    """One text line -> (nse_symbol, name, avg_mcap, rank) or None."""
     mi = ISIN_RE.search(line)
     if not mi or not CAT_RE.search(line[mi.end():]):
         return None
     after = CAT_RE.split(line[mi.end():])[0]
-    tokens = [t.strip("*") for t in after.split()]
+    tokens = join_split_numbers([t.strip("*") for t in after.split()])
     nums = [t for t in tokens if NUM_RE.match(t)]
     syms = [t for t in tokens if t and t != "-" and not NUM_RE.match(t) and SYM_RE.match(t)]
     if not nums or not syms:
         return None
     sym = syms[1] if len(syms) >= 2 else syms[0]
-    name = re.sub(r"^\s*\d+\s+", "", line[:mi.start()]).strip() or sym
-    return sym, name, to_num(nums[-1])
+    before = line[:mi.start()]
+    rm = RANK_RE.match(before)
+    rank = int(rm.group(1)) if rm else None
+    name = re.sub(r"^\s*\d+\s+", "", before).strip() or sym
+    return sym, name, to_num(nums[-1]), rank
 
 
 def parse_amfi(path):
     import pdfplumber
-    found = {"table_lines": {}, "table_text": {}, "text_3": {}, "text_1": {}}
+    found = {"text_3": {}, "text_1": {}, "table_lines": {}, "table_text": {}}
     period = None
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
@@ -157,6 +174,15 @@ def parse_amfi(path):
                 m = re.search(r"six months ended\s*(\d{1,2}[\s\-]*[A-Za-z]+[\s\-,]*\d{4})", text, re.I)
                 if m:
                     period = m.group(1)
+            for key, tol in (("text_3", 3), ("text_1", 1)):
+                try:
+                    t = page.extract_text(x_tolerance=tol) or ""
+                except Exception:
+                    t = ""
+                for line in t.splitlines():
+                    p = parse_line(line)
+                    if p:
+                        found[key][p[0]] = p
             table_methods = {
                 "table_lines": lambda: page.extract_tables(),
                 "table_text": lambda: page.extract_tables({"vertical_strategy": "text",
@@ -172,19 +198,39 @@ def parse_amfi(path):
                         p = parse_cells(cells)
                         if p:
                             found[key][p[0]] = p
-            for key, tol in (("text_3", 3), ("text_1", 1)):
-                try:
-                    t = page.extract_text(x_tolerance=tol) or ""
-                except Exception:
-                    t = ""
-                for line in t.splitlines():
-                    p = parse_line(line)
-                    if p:
-                        found[key][p[0]] = p
-    best = max(found, key=lambda k: len(found[k]))
-    print("AMFI rows found per method:", {k: len(v) for k, v in found.items()}, "-> using", best)
-    rows = {sym: {"name": clean_name(name) or sym, "mcap": mcap}
-            for sym, name, mcap in found[best].values()}
+    print("AMFI rows per method:", {k: len(v) for k, v in found.items()})
+    print("Rows >= limit per method:",
+          {k: sum(1 for x in v.values() if x[2] >= MIN_MCAP_CR) for k, v in found.items()})
+
+    # Combine methods: misreads make numbers smaller, so keep the largest reading
+    merged = {}
+    for rows in found.values():
+        for sym, name, val, rank in rows.values():
+            m = merged.get(sym)
+            if m is None:
+                merged[sym] = {"name": name, "val": val, "rank": rank}
+            else:
+                m["val"] = max(m["val"], val)
+                if m["rank"] is None:
+                    m["rank"] = rank
+
+    # The list is sorted biggest -> smallest: smooth values by rank to repair misreads
+    ranked = sorted((m["rank"], s) for s, m in merged.items() if m["rank"])
+    for m in merged.values():
+        m["mcap"] = m["val"]
+    if len(ranked) > 500:
+        ser = pd.Series([merged[s]["val"] for _, s in ranked], index=[r for r, _ in ranked])
+        smooth = ser.rolling(15, center=True, min_periods=5).median()
+        for (_, s), v in zip(ranked, smooth.values):
+            if not np.isnan(v):
+                merged[s]["mcap"] = max(float(v), merged[s]["val"]) if merged[s]["val"] <= v * 1.5 else float(v)
+    big = sum(1 for m in merged.values() if m["mcap"] >= MIN_MCAP_CR)
+    print(f"Companies above limit: raw {sum(1 for m in merged.values() if m['val'] >= MIN_MCAP_CR)}, "
+          f"after repair {big}")
+    if big > 2500:      # repair looks wrong: fall back to raw values
+        for m in merged.values():
+            m["mcap"] = m["val"]
+    rows = {s: {"name": clean_name(m["name"]) or s, "mcap": m["mcap"]} for s, m in merged.items()}
     return rows, period
 
 
@@ -380,6 +426,20 @@ def market_regime(nifty, vix):
     return regime, n, vix_now
 
 
+DATE_IN_TITLE = re.compile(r"(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                           r"[a-z]*,?\s+(\d{4})", re.I)
+
+
+def title_too_old(title, days):
+    m = DATE_IN_TITLE.search(title)
+    if not m:
+        return False
+    d = pd.to_datetime(f"{m.group(1)} {m.group(2)} {m.group(3)}", errors="coerce")
+    if d is None or pd.isna(d):
+        return False
+    return (pd.Timestamp(now_ist().date()) - d).days > days + 1
+
+
 def news(query, days=3, n=10):
     url = ("https://news.google.com/rss/search?q=" +
            requests.utils.quote(f"{query} when:{days}d") + "&hl=en-IN&gl=IN&ceid=IN:en")
@@ -390,13 +450,15 @@ def news(query, days=3, n=10):
         print("News error:", e)
         return 0, []
     cutoff = time.time() - days * 86400
-    fresh = []
+    titles = []
     for e in entries:
         pp = getattr(e, "published_parsed", None)
-        if pp and calendar.timegm(pp) < cutoff:
+        title = getattr(e, "title", "")
+        if not pp or calendar.timegm(pp) < cutoff or title_too_old(title, days):
             continue                       # skip old articles
-        fresh.append(e)
-    titles = [e.title for e in fresh[:n]]
+        titles.append(title)
+        if len(titles) >= n:
+            break
     score = 0
     for t in titles:
         low = t.lower()
@@ -447,7 +509,7 @@ def trade_plan(num, sym, r, mcap, size_factor, score, titles):
     pct = lambda x: (x / entry - 1) * 100
     return [
         f"\n<b>{num}. {sym}</b> – {setup}",
-        f"M.Cap ₹{mcap:,.0f} Cr | {r.EXT * 100:.1f}% above 20 EMA",
+        f"M.Cap ≈ ₹{mcap:,.0f} Cr | {r.EXT * 100:.1f}% above 20 EMA",
         f"Price ₹{entry:.2f} | ATR(14) ₹{atr:.2f} ({atr / entry * 100:.1f}% avg daily move)",
         f"Buy up to ₹{entry + 0.5 * atr:.2f} (don't chase)",
         f"🛑 SL ₹{stop:.2f}  ({ATR_STOP_MULT:g}×ATR, {pct(stop):.1f}%)",
