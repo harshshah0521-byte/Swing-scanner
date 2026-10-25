@@ -1,9 +1,10 @@
 """
-NSE Swing Scanner v7 -> Telegram
-Prices : Angel One SmartAPI (official NSE data)
-M.Cap  : AMFI list (amfi_mcap.pdf in this repository)
-MODE=live : during market hours, alerts new setups as they form (provisional)
-MODE=eod  : full report after market close
+NSE Momentum Swing Scanner v8 -> Telegram
+Strategy (chosen by backtest): new 50-day high on 2x volume, top 10% 6-month strength,
+above 200 SMA, only when Nifty is above its 200 SMA.
+Exit: stop loss 2 x ATR below entry, then sell when a day closes below the 20 EMA.
+Prices : Angel One SmartAPI (NSE).  M.Cap : AMFI list (amfi_mcap.pdf).
+MODE=live : during market hours.  MODE=eod : after market close.
 Educational tool, not investment advice.
 """
 import os, re, json, math, time, html, hashlib, calendar
@@ -23,23 +24,25 @@ except ImportError:
 CAPITAL        = float(os.getenv("CAPITAL") or 100000)  # trading capital in Rs
 RISK_PCT       = 0.01    # risk 1% of capital per trade
 MAX_ALLOC      = 0.20    # max 20% of capital in one stock
+MAX_POSITIONS  = 5       # max stocks held at once
 MAX_ALERTS     = 5       # max buy ideas per message
 ATR_STOP_MULT  = 2.0     # stop loss = entry - 2 x ATR
-T1_ATR_MULT    = 4.0     # target 1 = entry + 4 x ATR
-T2_ATR_MULT    = 6.0     # target 2 = entry + 6 x ATR
+MAX_HOLD_DAYS  = 60      # time exit (trading days)
 MIN_MCAP_CR    = 5000    # minimum market cap, Rs crore
 MIN_TURNOVER   = 5e7     # minimum avg daily traded value: Rs 5 crore
-BASE_MAX_RANGE = 0.15    # breakout base: prior 20-day range must be <= 15%
-MAX_EXTENSION  = 0.06    # breakout price must be <= 6% above 20 EMA
-VIX_CAUTION    = 20
+HIGH_LOOKBACK  = 50      # new N-day high
+VOL_MULT       = 2.0     # volume must be > 2x the 20-day average
+MIN_CLV        = 0.7     # close in the top 30% of the day's range
+RS_LOOKBACK    = 126     # 6-month performance for strength rank
+MIN_RS_RANK    = 0.90    # top 10% of all scanned stocks
+MARKET_FILTER  = os.getenv("MARKET_FILTER", "on")   # "on" = no buys when Nifty < 200 SMA
 LIVE_SKIP_MIN  = 30      # live mode ignores the first 30 minutes after open
-REGIME_MODE    = os.getenv("REGIME_MODE", "lenient")   # "lenient", "off" or "strict"
-MODE           = os.getenv("MODE", "eod").lower()       # "live" or "eod"
+MODE           = os.getenv("MODE", "eod").lower()   # "live" or "eod"
 
-HIST_DAYS       = 2000   # days of history downloaded per stock
-FETCH_PAUSE     = 0.4    # seconds between history downloads (Angel rate limit)
-REFRESH_PER_DAY = 40     # stocks re-downloaded each evening to stay accurate
-MAX_FETCH_LIVE  = 300    # max history downloads in one live run
+HIST_DAYS       = 2000
+FETCH_PAUSE     = 0.4
+REFRESH_PER_DAY = 40
+MAX_FETCH_LIVE  = 300
 
 AMFI_FILE  = "amfi_mcap.pdf"
 CACHE_FILE = "history.pkl.gz"
@@ -48,12 +51,6 @@ SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files
 NIFTY, VIX = "NIFTY50", "INDIAVIX"
 NIFTY_TOKEN, VIX_TOKEN = "99926000", "99926017"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-
-SIZE_MAP = {
-    "strict":  {"BULLISH": 1.0, "CAUTION": 0.5, "BEARISH": 0.0},
-    "lenient": {"BULLISH": 1.0, "CAUTION": 1.0, "BEARISH": 0.5},
-    "off":     {"BULLISH": 1.0, "CAUTION": 1.0, "BEARISH": 1.0},
-}
 
 POS_WORDS = ["upgrade", "order win", "bags order", "wins order", "record profit", "profit rises",
              "profit jumps", "beats estimate", "buyback", "target raised", "raises target",
@@ -78,12 +75,12 @@ def load_cache():
     try:
         c = pd.read_pickle(CACHE_FILE)
         if isinstance(c, dict):
-            for k in ("bars", "fetched", "amfi", "tokens", "alerts"):
+            for k in ("bars", "fetched", "amfi", "tokens", "alerts", "market"):
                 c.setdefault(k, {})
             return c
     except Exception as e:
         print("No saved data yet:", e)
-    return {"bars": {}, "fetched": {}, "amfi": {}, "tokens": {}, "alerts": {}}
+    return {"bars": {}, "fetched": {}, "amfi": {}, "tokens": {}, "alerts": {}, "market": {}}
 
 
 def save_cache(c):
@@ -108,7 +105,6 @@ def to_num(s):
 
 
 def join_split_numbers(tokens):
-    """Re-joins numbers the PDF split into pieces, e.g. '14,4' + '79.51'."""
     out = []
     for t in tokens:
         if out and t[:1].isdigit() and re.fullmatch(r"\d[\d,]*,|\d[\d,]*,\d{1,2}", out[-1]):
@@ -119,7 +115,6 @@ def join_split_numbers(tokens):
 
 
 def parse_cells(cells):
-    """One table row -> (nse_symbol, name, avg_mcap, rank) or None."""
     cells = [re.sub(r"\s+", " ", str(c or "")).strip() for c in cells]
     idx = next((i for i, c in enumerate(cells) if ISIN_RE.fullmatch(c.replace(" ", ""))), None)
     if idx is None:
@@ -130,7 +125,7 @@ def parse_cells(cells):
     if not nums:
         return None
     if len(rest) >= 4 and rest[2] and SYM_RE.match(rest[2]) and not NUM_RE.match(rest[2]):
-        sym = rest[2]                       # NSE symbol column
+        sym = rest[2]
     else:
         syms = [c for c in rest if c and c != "-" and not NUM_RE.match(c) and SYM_RE.match(c)]
         if not syms:
@@ -142,7 +137,6 @@ def parse_cells(cells):
 
 
 def parse_line(line):
-    """One text line -> (nse_symbol, name, avg_mcap, rank) or None."""
     mi = ISIN_RE.search(line)
     if not mi or not CAT_RE.search(line[mi.end():]):
         return None
@@ -199,10 +193,6 @@ def parse_amfi(path):
                         if p:
                             found[key][p[0]] = p
     print("AMFI rows per method:", {k: len(v) for k, v in found.items()})
-    print("Rows >= limit per method:",
-          {k: sum(1 for x in v.values() if x[2] >= MIN_MCAP_CR) for k, v in found.items()})
-
-    # Combine methods: misreads make numbers smaller, so keep the largest reading
     merged = {}
     for rows in found.values():
         for sym, name, val, rank in rows.values():
@@ -213,8 +203,6 @@ def parse_amfi(path):
                 m["val"] = max(m["val"], val)
                 if m["rank"] is None:
                     m["rank"] = rank
-
-    # The list is sorted biggest -> smallest: smooth values by rank to repair misreads
     ranked = sorted((m["rank"], s) for s, m in merged.items() if m["rank"])
     for m in merged.values():
         m["mcap"] = m["val"]
@@ -225,9 +213,8 @@ def parse_amfi(path):
             if not np.isnan(v):
                 merged[s]["mcap"] = max(float(v), merged[s]["val"]) if merged[s]["val"] <= v * 1.5 else float(v)
     big = sum(1 for m in merged.values() if m["mcap"] >= MIN_MCAP_CR)
-    print(f"Companies above limit: raw {sum(1 for m in merged.values() if m['val'] >= MIN_MCAP_CR)}, "
-          f"after repair {big}")
-    if big > 2500:      # repair looks wrong: fall back to raw values
+    print(f"Companies above limit after repair: {big}")
+    if big > 2500:
         for m in merged.values():
             m["mcap"] = m["val"]
     rows = {s: {"name": clean_name(m["name"]) or s, "mcap": m["mcap"]} for s, m in merged.items()}
@@ -355,75 +342,49 @@ def with_today(hist, q, today):
     return row if base is None or base.empty else pd.concat([base, row])
 
 
-# ===================== INDICATORS =====================
+# ===================== INDICATORS & SIGNAL =====================
 def add_indicators(df):
     c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
     df["EMA20"] = c.ewm(span=20, adjust=False).mean()
     df["EMA50"] = c.ewm(span=50, adjust=False).mean()
     df["SMA200"] = c.rolling(200).mean()
-
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     df["RSI"] = 100 - 100 / (1 + gain / loss)
-
     prev_c = c.shift(1)
     tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
-
-    up, down = h.diff(), -l.diff()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    plus_di = 100 * plus_dm.ewm(alpha=1/14, adjust=False).mean() / df["ATR"]
-    minus_di = 100 * minus_dm.ewm(alpha=1/14, adjust=False).mean() / df["ATR"]
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean()
-
     df["VOL_AVG"] = v.rolling(20).mean().shift(1)
-    df["HH20"] = h.rolling(20).max().shift(1)
-    df["LL20"] = l.rolling(20).min().shift(1)
+    df["HH50"] = h.rolling(HIGH_LOOKBACK).max().shift(1)
     df["CLV"] = (c - l) / (h - l).replace(0, np.nan)
     df["EXT"] = c / df["EMA20"] - 1
     return df
 
 
-def add_signals(df, nifty_close):
-    c, o, h, l = df["Close"], df["Open"], df["High"], df["Low"]
+def add_signals(df, nifty_close, rs_rank=None):
+    c = df["Close"]
     n = nifty_close.reindex(df.index).ffill()
     df["RS"] = (c / c.shift(63)) / (n / n.shift(63))
     df["VOL_RATIO"] = df["Volume"] / df["VOL_AVG"]
-
-    uptrend = (c > df["SMA200"]) & (df["EMA20"] > df["EMA50"])
+    df["RSR"] = rs_rank.reindex(df.index) if rs_rank is not None else np.nan
     liquid = (c * df["VOL_AVG"]) > MIN_TURNOVER
-    strong = df["RS"] > 1.0
-    base_tight = (df["HH20"] - df["LL20"]) / df["LL20"] <= BASE_MAX_RANGE
-
-    breakout = (c > df["HH20"]) & base_tight & (df["VOL_RATIO"] > 1.5) & \
-               df["RSI"].between(55, 75) & (df["CLV"] >= 0.7) & (df["EXT"] <= MAX_EXTENSION)
-    pullback = (df["ADX"] > 20) & (l.rolling(3).min() <= df["EMA20"] * 1.01) & \
-               (c > df["EMA20"]) & (c > o) & (c > h.shift(1)) & \
-               df["RSI"].between(40, 60) & (df["VOL_RATIO"] > 1.0)
-
-    base = uptrend & liquid & strong
-    df["BREAKOUT"] = base & breakout
-    df["PULLBACK"] = base & pullback & ~breakout
-    df["SIGNAL"] = df["BREAKOUT"] | df["PULLBACK"]
+    df["SIGNAL"] = (liquid & (c > df["SMA200"]) & (c > df["HH50"]) &
+                    (df["VOL_RATIO"] > VOL_MULT) & (df["RSR"] >= MIN_RS_RANK) &
+                    (df["CLV"] >= MIN_CLV))
     return df
 
 
+def strength_ranks(data, symbols):
+    closes = pd.DataFrame({s: data[s]["Close"] for s in symbols if s in data}).sort_index()
+    return (closes / closes.shift(RS_LOOKBACK) - 1).rank(axis=1, pct=True)
+
+
 # ===================== MARKET & NEWS =====================
-def market_regime(nifty, vix):
+def market_state(nifty, vix):
     n = add_indicators(nifty.copy()).iloc[-1]
     vix_now = float(vix["Close"].iloc[-1]) if vix is not None and len(vix) else float("nan")
-    if n.Close > n.EMA50 and n.Close > n.SMA200:
-        regime = "BULLISH"
-    elif n.Close > n.SMA200:
-        regime = "CAUTION"
-    else:
-        regime = "BEARISH"
-    if regime == "BULLISH" and vix_now > VIX_CAUTION:
-        regime = "CAUTION"
-    return regime, n, vix_now
+    return bool(n.Close > n.SMA200), n, vix_now
 
 
 DATE_IN_TITLE = re.compile(r"(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
@@ -455,7 +416,7 @@ def news(query, days=3, n=10):
         pp = getattr(e, "published_parsed", None)
         title = getattr(e, "title", "")
         if not pp or calendar.timegm(pp) < cutoff or title_too_old(title, days):
-            continue                       # skip old articles
+            continue
         titles.append(title)
         if len(titles) >= n:
             break
@@ -475,53 +436,50 @@ def alerts_today(cache, today):
     return a
 
 
-def find_hits(universe, data, nifty_close, today, live_frac=None):
+def find_hits(universe, data, nifty_close, today, ranks, live_frac=None):
     hits = []
     for s, info in universe.items():
         df = data.get(s)
-        if df is None or len(df) < 220 or df.index[-1] != today:
+        if df is None or len(df) < 220 or df.index[-1] != today or s not in ranks:
             continue
         df = df.copy()
         df["Volume"] = df["Volume"].astype(float)
         if live_frac:   # project today's partial volume to a full day
             df.iloc[-1, df.columns.get_loc("Volume")] /= live_frac
-        df = add_signals(add_indicators(df), nifty_close)
+        df = add_signals(add_indicators(df), nifty_close, ranks[s])
         row = df.iloc[-1]
         if row["SIGNAL"]:
             hits.append((s, info, row))
-    hits.sort(key=lambda x: x[2]["RS"], reverse=True)
+    hits.sort(key=lambda x: x[2]["RSR"], reverse=True)
     return hits
 
 
-def trade_plan(num, sym, r, mcap, size_factor, score, titles):
+def trade_plan(num, sym, r, mcap, score, titles):
     entry = float(r.Close)
     atr = float(r.ATR)
     stop = entry - ATR_STOP_MULT * atr
-    t1 = entry + T1_ATR_MULT * atr
-    t2 = entry + T2_ATR_MULT * atr
     risk = entry - stop
     if risk <= 0:
         return None
-    qty = math.floor(min(CAPITAL * RISK_PCT * size_factor / risk, CAPITAL * MAX_ALLOC / entry))
+    qty = math.floor(min(CAPITAL * RISK_PCT / risk, CAPITAL * MAX_ALLOC / entry))
     if qty < 1:
         return None
-    setup = "Base breakout" if r.BREAKOUT else "Pullback to 20 EMA"
     pct = lambda x: (x / entry - 1) * 100
+    ref2, ref4 = entry + 2 * risk, entry + 4 * risk
+    top = max(1, round((1 - float(r.RSR)) * 100))
     return [
-        f"\n<b>{num}. {sym}</b> – {setup}",
-        f"M.Cap ≈ ₹{mcap:,.0f} Cr | {r.EXT * 100:.1f}% above 20 EMA",
-        f"Price ₹{entry:.2f} | ATR(14) ₹{atr:.2f} ({atr / entry * 100:.1f}% avg daily move)",
-        f"Buy up to ₹{entry + 0.5 * atr:.2f} (don't chase)",
-        f"🛑 SL ₹{stop:.2f}  ({ATR_STOP_MULT:g}×ATR, {pct(stop):.1f}%)",
-        f"🎯 T1 ₹{t1:.2f}  ({T1_ATR_MULT:g}×ATR, +{pct(t1):.1f}%, {T1_ATR_MULT / ATR_STOP_MULT:.1f}R)",
-        f"🎯 T2 ₹{t2:.2f}  ({T2_ATR_MULT:g}×ATR, +{pct(t2):.1f}%, {T2_ATR_MULT / ATR_STOP_MULT:.1f}R)",
-        f"Qty {qty} (risk ≈ ₹{qty * risk:,.0f}) | RSI {r.RSI:.0f} | ADX {r.ADX:.0f} | "
-        f"Vol {r.VOL_RATIO:.1f}x | RS {r.RS:.2f}",
+        f"\n<b>{num}. {sym}</b> – Momentum: new {HIGH_LOOKBACK}-day high",
+        f"M.Cap ≈ ₹{mcap:,.0f} Cr | Top {top}% by 6-month strength | Vol {r.VOL_RATIO:.1f}x",
+        f"Price ₹{entry:.2f} | ATR ₹{atr:.2f} | Buy up to ₹{entry + 0.5 * atr:.2f} (don't chase)",
+        f"🛑 Stop loss ₹{stop:.2f} ({pct(stop):.1f}%) – place as SL/GTT right after buying",
+        f"🚪 Exit rule: sell when a day CLOSES below the 20 EMA (now ₹{r.EMA20:.2f}). No fixed target.",
+        f"📏 Reference only: +2R ₹{ref2:.2f} (+{pct(ref2):.1f}%), +4R ₹{ref4:.2f} (+{pct(ref4):.1f}%)",
+        f"Qty {qty} (≈ ₹{qty * entry:,.0f} invested, risk ≈ ₹{qty * risk:,.0f})",
         f"News score {score:+d}" + (f": {html.escape(titles[0])}" if titles else ": no recent news"),
     ]
 
 
-def pick_setups(hits, size_factor, limit):
+def pick_setups(hits, limit):
     lines, alerted, filtered = [], [], []
     for s, info, r in hits:
         if len(alerted) >= limit:
@@ -532,7 +490,7 @@ def pick_setups(hits, size_factor, limit):
             lines.append(f"\n⛔ {s} skipped – negative news: {head}")
             filtered.append(s)
             continue
-        plan = trade_plan(len(alerted) + 1, s, r, info["mcap"], size_factor, score, titles)
+        plan = trade_plan(len(alerted) + 1, s, r, info["mcap"], score, titles)
         if plan is None:
             filtered.append(s)
             continue
@@ -565,40 +523,40 @@ def check_positions(data, positions):
         r = add_indicators(df.copy()).iloc[-1]
         entry, stop = float(p["entry"]), float(p["stop"])
         risk = entry - stop if entry > stop else entry * 0.05
-        target = float(p.get("target", entry + 2 * risk))
         R = (r.Close - entry) / risk
-        trail = max(stop, r.Close - ATR_STOP_MULT * r.ATR)
-        if r.Close <= stop:
-            action = "🔴 EXIT – closed below stop loss"
-        elif r.Close >= target:
-            action = "🎯 Target hit – book half, trail the rest"
-        elif r.Close < r.EMA20 and R > 0:
-            action = "🟠 Closed below 20 EMA – consider exiting"
+        held = None
+        d = pd.to_datetime(p.get("date"), errors="coerce") if p.get("date") else None
+        if d is not None and not pd.isna(d):
+            held = int((df.index > d).sum())
+        if r.Low <= stop:
+            action = "🔴 STOP LOSS hit – exit"
+        elif r.Close < r.EMA20:
+            action = f"🔴 EXIT – closed below 20 EMA (₹{r.EMA20:.2f}). Sell tomorrow morning."
+        elif held is not None and held >= MAX_HOLD_DAYS:
+            action = f"⏰ Held {held} days – time exit, sell"
         else:
-            action = "✅ Hold"
-        msg = f"<b>{s}</b> ₹{r.Close:.2f} ({R:+.1f}R) – {action}"
-        if trail > stop:
-            msg += f"\n   Trail stop up to ₹{trail:.2f} (update positions.json + broker SL)"
-        out.append(msg)
+            action = f"✅ Hold – exit if a day closes below 20 EMA (now ₹{r.EMA20:.2f})"
+        out.append(f"<b>{s}</b> ₹{r.Close:.2f} ({R:+.1f}R) – {action}")
     return out
 
 
-def live_position_alerts(data, positions, today, alerts):
+def live_position_alerts(data, positions, today, alerts, now):
     out = []
+    late = minutes_since_open(now) >= 345     # after 3:00 PM
     for p in positions:
         s = clean(p["symbol"])
         df = data.get(s)
-        if df is None or not len(df) or df.index[-1] != today:
+        if df is None or len(df) < 50 or df.index[-1] != today:
             continue
-        r = df.iloc[-1]
-        entry, stop = float(p["entry"]), float(p["stop"])
-        target = float(p.get("target", entry + 2 * (entry - stop)))
+        r = add_indicators(df.copy()).iloc[-1]
+        stop = float(p["stop"])
         if r.Low <= stop and f"{s}:SL" not in alerts["sent"]:
             out.append(f"🔴 <b>{s}</b> touched stop loss ₹{stop:.2f} (now ₹{r.Close:.2f})")
             alerts["sent"].append(f"{s}:SL")
-        if r.High >= target and f"{s}:TGT" not in alerts["sent"]:
-            out.append(f"🎯 <b>{s}</b> touched target ₹{target:.2f} (now ₹{r.Close:.2f})")
-            alerts["sent"].append(f"{s}:TGT")
+        if late and r.Close < r.EMA20 and f"{s}:EMA" not in alerts["sent"]:
+            out.append(f"⚠️ <b>{s}</b> is trading below its 20 EMA (₹{r.EMA20:.2f}), now ₹{r.Close:.2f}. "
+                       f"If it closes there, the exit rule says sell.")
+            alerts["sent"].append(f"{s}:EMA")
     return out
 
 
@@ -630,22 +588,23 @@ def notify_error(msg, manual):
 
 
 # ===================== LIVE MODE =====================
-def run_live(universe, data, nifty, today, regime, size_factor, alerts, positions, now):
+def run_live(universe, data, nifty, today, can_buy, ranks, alerts, positions, now):
     frac = min(max(minutes_since_open(now) / 375, 0.1), 1.0)
     done = {k.split(":")[0] for k in alerts["sent"] if k.endswith((":BUY", ":X"))}
     setup_lines = []
-    if size_factor > 0:
-        hits = [h for h in find_hits(universe, data, nifty["Close"], today, frac) if h[0] not in done]
-        setup_lines, alerted, filtered = pick_setups(hits, size_factor, MAX_ALERTS)
+    if can_buy:
+        hits = [h for h in find_hits(universe, data, nifty["Close"], today, ranks, frac)
+                if h[0] not in done]
+        setup_lines, alerted, filtered = pick_setups(hits, MAX_ALERTS)
         alerts["sent"] += [f"{s}:BUY" for s in alerted] + [f"{s}:X" for s in filtered]
-    pos_lines = live_position_alerts(data, positions, today, alerts)
+    pos_lines = live_position_alerts(data, positions, today, alerts, now)
     if not setup_lines and not pos_lines:
         print("Nothing new this run.")
         return
     lines = [f"⚡ <b>LIVE – {now:%d %b, %I:%M %p} IST</b>",
-             f"Market: {regime} | Nifty {nifty['Close'].iloc[-1]:,.0f}"]
+             f"Nifty {nifty['Close'].iloc[-1]:,.0f} | You hold {len(positions)}/{MAX_POSITIONS}"]
     if setup_lines:
-        lines.append("\n🟢 <b>NEW SETUPS (today's candle not closed yet)</b>")
+        lines.append("\n🟢 <b>NEW MOMENTUM SIGNALS (today's candle not closed yet)</b>")
         lines += setup_lines
         lines.append("\n<i>Live signals can fail by 3:30 PM. Safer: buy after 3 PM if still "
                      "valid, or wait for the EOD report.</i>")
@@ -656,28 +615,24 @@ def run_live(universe, data, nifty, today, regime, size_factor, alerts, position
 
 
 # ===================== EOD MODE =====================
-def run_eod(universe, data, nifty, today, regime, n, vix_now, size_factor,
-            alerts, positions, pending, period):
+def run_eod(universe, data, nifty, today, can_buy, market_ok, n, vix_now, ranks,
+            alerts, positions, pending, period, turned):
     live_alerted = {k.split(":")[0] for k in alerts["sent"] if k.endswith(":BUY")}
-    hits = find_hits(universe, data, nifty["Close"], today)
+    hits = find_hits(universe, data, nifty["Close"], today, ranks)
 
-    lines = [f"📊 <b>EOD Swing Scan – {today:%d %b %Y}</b>",
-             f"Market: <b>{regime}</b> | Nifty {n.Close:,.0f} "
-             f"(50EMA {n.EMA50:,.0f}, 200SMA {n.SMA200:,.0f}) | VIX {vix_now:.1f}",
-             f"Scanned {len(universe)} stocks (M.Cap ≥ ₹{MIN_MCAP_CR:,} Cr) | "
-             f"{len(hits)} passed chart rules"]
-    if len(universe) < 200:
-        lines.append(f"⚠️ Only {len(universe)} companies were read from {AMFI_FILE}. "
-                     f"The file may be the wrong one or in a new format.")
+    status = "✅ OK to buy" if market_ok else "⛔ No new buys"
+    lines = [f"📊 <b>EOD Momentum Scan – {today:%d %b %Y}</b>",
+             f"Market: <b>{status}</b> | Nifty {n.Close:,.0f} vs 200SMA {n.SMA200:,.0f} | VIX {vix_now:.1f}",
+             f"Scanned {len(universe)} stocks (M.Cap ≥ ₹{MIN_MCAP_CR:,} Cr) | {len(hits)} momentum signals",
+             f"💼 You hold {len(positions)}/{MAX_POSITIONS} positions"]
+    if turned:
+        lines.append(turned)
     if pending:
-        lines.append(f"⏳ Price history still loading for {pending} stocks – "
-                     f"they'll be included in coming runs.")
+        lines.append(f"⏳ Price history still loading for {pending} stocks.")
     age = amfi_age_days(period)
     if age is not None and age > 195:
-        lines.append(f"📅 Your AMFI file is for the period ending {period}. A newer list "
-                     f"should be out – please replace {AMFI_FILE}.")
-    if size_factor < 1:
-        lines.append(f"⚠️ Weak market – position sizes x{size_factor}")
+        lines.append(f"📅 Your AMFI file is for the period ending {period}. "
+                     f"A newer list should be out – please replace {AMFI_FILE}.")
 
     _, mkt_titles = news("Sensex Nifty stock market", days=2, n=3)
     if mkt_titles:
@@ -694,16 +649,19 @@ def run_eod(universe, data, nifty, today, regime, n, vix_now, size_factor,
         if failed:
             lines.append("❌ Failed by close (avoid; if bought, watch your stop): " + ", ".join(failed))
 
-    lines.append("\n🟢 <b>BUY SETUPS</b>")
-    if size_factor == 0:
-        lines.append("Strict mode: Nifty below 200-day average – no new buys.")
+    lines.append("\n🟢 <b>BUY SIGNALS</b>")
+    if not can_buy:
+        lines.append("Nifty is below its 200-day average. The strategy doesn't buy in this market "
+                     "(in the backtest these trades lost money). Your positions are still watched.")
     elif not hits:
-        lines.append("No setups today. Patience is a position.")
+        lines.append("No momentum signals today.")
     else:
-        setup_lines, alerted, _ = pick_setups(hits, size_factor, MAX_ALERTS)
+        if len(positions) >= MAX_POSITIONS:
+            lines.append("Your 5 slots are full – only buy if you exit something first.")
+        setup_lines, alerted, _ = pick_setups(hits, MAX_ALERTS)
         lines += setup_lines
         if not alerted:
-            lines.append("No setups left after filters.")
+            lines.append("No signals left after filters.")
 
     lines.append("\n💼 <b>OPEN POSITIONS</b>")
     lines += check_positions(data, positions) or ["None listed in positions.json"]
@@ -713,7 +671,6 @@ def run_eod(universe, data, nifty, today, regime, n, vix_now, size_factor,
 
 # ===================== MAIN =====================
 def run(cache, now, manual):
-    # 1. Companies above the market-cap limit, from the AMFI file
     try:
         universe, period = get_universe(cache)
     except FileNotFoundError:
@@ -726,7 +683,6 @@ def run(cache, now, manual):
         notify_error(f"No companies above ₹{MIN_MCAP_CR} Cr were found in {AMFI_FILE}.", manual)
         return
 
-    # 2. Log in to Angel One and get instrument codes
     try:
         api = angel_login()
     except Exception as e:
@@ -742,7 +698,6 @@ def run(cache, now, manual):
                if s in tok["map"]]
     print(f"{len(universe)} companies from AMFI, {len(symbols)} found on NSE")
 
-    # 3. Today's prices
     quotes = fetch_quotes(api, [tok["nifty"], tok["vix"]] + [tok["map"][s] for s in symbols])
     nq = quotes.get(tok["nifty"])
     days = [d for d in (quote_bar(q)[0] for q in quotes.values()) if d is not None]
@@ -753,9 +708,8 @@ def run(cache, now, manual):
             print("Market not open today (holiday?). Exiting.")
             return
         if nday is not None:
-            today = nday   # manual test on a weekend/holiday: use the last trading day
+            today = nday
 
-    # 4. Nifty and VIX history
     nifty_hist = fetch_candles(api, tok["nifty"])
     if nifty_hist is None:
         nifty_hist = cache["bars"].get(NIFTY)
@@ -769,7 +723,6 @@ def run(cache, now, manual):
     vix = with_today(vix_hist, quotes.get(tok["vix"]), today) if vix_hist is not None else None
     prev_session = nifty.index[nifty.index < today].max()
 
-    # 5. Stock history: only download what is missing or outdated
     need = []
     for s in symbols:
         h = cache["bars"].get(s)
@@ -780,7 +733,7 @@ def run(cache, now, manual):
         last = h[h.index < today]["Close"]
         if bar and len(last) and bar["Open"] > 0:
             ratio = bar["Open"] / last.iloc[-1]
-            if ratio < 0.6 or ratio > 1.6:     # big gap (split/bonus?): re-download
+            if ratio < 0.6 or ratio > 1.6:
                 need.append(s)
     if MODE == "eod":
         others = sorted((s for s in symbols if s not in need),
@@ -804,14 +757,13 @@ def run(cache, now, manual):
     pending = sum(1 for s in symbols if cache["bars"].get(s) is None
                   or cache["bars"][s].index.max() < prev_session)
 
-    # 6. Price tables = saved history + today's bar
     data = {}
     for s in symbols:
         f = with_today(cache["bars"].get(s), quotes.get(tok["map"][s]), today)
         if f is not None and len(f):
             data[s] = f
     day_complete = today < pd.Timestamp(now.date()) or minutes_since_open(now) >= 380
-    if day_complete:      # after 3:35 PM today's bar is final, so keep it
+    if day_complete:
         for s, f in data.items():
             cache["bars"][s] = f
         cache["bars"][NIFTY] = nifty
@@ -822,15 +774,23 @@ def run(cache, now, manual):
         if vix is not None:
             cache["bars"][VIX] = vix[vix.index < today]
 
-    # 7. Market condition, scan and Telegram message
-    regime, n, vix_now = market_regime(nifty, vix)
-    size_factor = SIZE_MAP.get(REGIME_MODE, SIZE_MAP["lenient"])[regime]
+    market_ok, n, vix_now = market_state(nifty, vix)
+    can_buy = market_ok or MARKET_FILTER == "off"
+    ranks = strength_ranks(data, [s for s in universe if s in data])
     alerts = alerts_today(cache, today)
+
     if MODE == "live":
-        run_live(universe, data, nifty, today, regime, size_factor, alerts, positions, now)
+        run_live(universe, data, nifty, today, can_buy, ranks, alerts, positions, now)
     else:
-        run_eod(universe, data, nifty, today, regime, n, vix_now, size_factor,
-                alerts, positions, pending, period)
+        turned = ""
+        prev = cache["market"].get("ok")
+        if prev is not None and prev != market_ok:
+            turned = ("🔔 <b>Market turned OK for buying</b> (Nifty back above its 200-day average)"
+                      if market_ok else
+                      "🔔 <b>Market turned weak</b> (Nifty fell below its 200-day average) – no new buys")
+        cache["market"]["ok"] = market_ok
+        run_eod(universe, data, nifty, today, can_buy, market_ok, n, vix_now, ranks,
+                alerts, positions, pending, period, turned)
 
 
 def main():
