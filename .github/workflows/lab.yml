@@ -1,0 +1,36 @@
+name: Strategy Lab
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install tools
+        run: pip install -r requirements.txt
+
+      - name: Load saved price history
+        uses: actions/cache/restore@v4
+        with:
+          path: history.pkl.gz
+          key: hist-${{ github.run_id }}
+          restore-keys: hist-
+
+      - name: Run strategy lab
+        run: python lab.py
+
+      - name: Save results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-results
+          path: lab_results.csv
+          if-no-files-found: ignore
