@@ -1,0 +1,51 @@
+name: EOD Scan
+
+on:
+  schedule:
+    - cron: "45 10 * * 1-5"   # 4:15 PM IST, Monday to Friday
+  workflow_dispatch:          # lets you run it manually
+
+concurrency:
+  group: swing-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install tools
+        run: pip install -r requirements.txt
+
+      - name: Load saved price history
+        uses: actions/cache/restore@v4
+        with:
+          path: history.pkl.gz
+          key: hist-${{ github.run_id }}
+          restore-keys: hist-
+
+      - name: Run scanner (EOD)
+        run: python scanner.py
+        env:
+          MODE: eod
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CAPITAL: ${{ secrets.CAPITAL }}
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+
+      - name: Save price history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: history.pkl.gz
+          key: hist-${{ github.run_id }}-${{ github.run_attempt }}
