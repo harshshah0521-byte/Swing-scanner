@@ -99,7 +99,7 @@ def main():
         arr = tuple(df[k].to_numpy() for k in ["Open", "High", "Low", "Close", "ATR", "EMA20"])
         dates = df.index
         for ename, sig in entries(df).items():
-            sig = sig.fillna(False).to_numpy(dtype=bool)
+            sig = np.array(sig.fillna(False), dtype=bool)
             sig[:200] = False
             for mname, mask in (("any", None), ("nifty>200", ok)):
                 idx = np.flatnonzero(sig if mask is None else (sig & mask))
