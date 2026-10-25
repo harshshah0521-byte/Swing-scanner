@@ -1,97 +1,77 @@
-"""Backtest: tests the scanner rules on the price history saved by the scanner."""
+"""Backtest of the momentum strategy on the price history saved by the scanner."""
 import numpy as np
 import pandas as pd
-from scanner import (NIFTY, VIX, ATR_STOP_MULT, T1_ATR_MULT,
+from scanner import (NIFTY, VIX, ATR_STOP_MULT, MAX_HOLD_DAYS, RS_LOOKBACK,
                      load_cache, add_indicators, add_signals)
 
-COST = 0.003                               # ~0.3% round trip: STT, brokerage, charges
-TARGET_R = T1_ATR_MULT / ATR_STOP_MULT     # exits at Target 1
-MAX_HOLD = 20                              # exit after 20 trading days if nothing hit
-
-
-def regime_series(nifty):
-    n = add_indicators(nifty.copy())
-    labels = np.select([(n["Close"] > n["EMA50"]) & (n["Close"] > n["SMA200"]),
-                        n["Close"] > n["SMA200"]], ["BULLISH", "CAUTION"], default="BEARISH")
-    return pd.Series(labels, index=n.index)
-
-
-def stats(r, label):
-    if r.empty:
-        print(f"{label:<34} no trades")
-        return
-    win = r["R"] > 0
-    losses = -r["R"][~win].sum()
-    pf = r["R"][win].sum() / losses if losses else float("inf")
-    print(f"{label:<34} trades {len(r):>5} | win {win.mean():5.1%} | "
-          f"avg R {r['R'].mean():+.2f} | profit factor {pf:.2f}")
+COST = 0.003   # ~0.3% round trip: STT, brokerage, charges
 
 
 def main():
-    cache = load_cache()
-    bars = cache["bars"]
-    if NIFTY not in bars or len(bars) < 50:
-        print("No saved price history yet. Run 'EOD Scan' once first, then try again.")
+    bars = load_cache()["bars"]
+    if NIFTY not in bars:
+        print("No saved price history yet. Run 'EOD Scan' first.")
         return
-    nifty = bars[NIFTY]
-    regime = regime_series(nifty)
-    trades, used = [], 0
+    nifty = add_indicators(bars[NIFTY].copy())
+    mkt_ok = nifty["Close"] > nifty["SMA200"]
+    stocks = {s: d for s, d in bars.items()
+              if s not in (NIFTY, VIX) and d is not None and len(d) >= 300}
+    closes = pd.DataFrame({s: d["Close"] for s, d in stocks.items()}).sort_index()
+    ranks = (closes / closes.shift(RS_LOOKBACK) - 1).rank(axis=1, pct=True)
 
-    for s, df0 in bars.items():
-        if s in (NIFTY, VIX) or df0 is None or len(df0) < 300:
-            continue
-        used += 1
-        df = add_signals(add_indicators(df0.copy()), nifty["Close"])
-        mkt = regime.reindex(df.index).ffill().fillna("BEARISH").to_numpy()
-        sig, brk = df["SIGNAL"].to_numpy(), df["BREAKOUT"].to_numpy()
-        o, h, l, c = (df[k].to_numpy() for k in ["Open", "High", "Low", "Close"])
-        atr = df["ATR"].to_numpy()
-
-        i = 200
-        while i < len(df) - 1:
-            if not sig[i]:
-                i += 1
+    trades = []
+    for s, d in stocks.items():
+        df = add_signals(add_indicators(d.copy()), nifty["Close"], ranks[s])
+        ok = mkt_ok.reindex(df.index).ffill().fillna(False).to_numpy(dtype=bool)
+        sig = np.array(df["SIGNAL"].fillna(False), dtype=bool) & ok
+        sig[:200] = False
+        o, h, l, c, atr, ema = (df[k].to_numpy() for k in ["Open", "High", "Low", "Close", "ATR", "EMA20"])
+        n, next_free = len(df), 0
+        for i in np.flatnonzero(sig):
+            if i < next_free or i >= n - 1:
                 continue
-            entry = o[i + 1]                       # buy next day's open
+            entry = o[i + 1]
             stop = c[i] - ATR_STOP_MULT * atr[i]
-            if entry <= stop:
-                i += 1
+            if not np.isfinite(entry) or entry <= stop:
                 continue
             risk = entry - stop
-            target = entry + TARGET_R * risk
-            exit_px = None
-            for k in range(i + 1, min(i + 1 + MAX_HOLD, len(df))):
-                if l[k] <= stop:                   # stop checked first = cautious
-                    exit_px = min(o[k], stop)
+            exit_px, k_exit = None, None
+            last = min(i + MAX_HOLD_DAYS, n - 1)
+            for k in range(i + 1, last + 1):
+                if l[k] <= stop:
+                    exit_px, k_exit = min(o[k], stop), k
                     break
-                if h[k] >= target:
-                    exit_px = max(o[k], target)
+                if k > i + 1 and c[k] < ema[k]:
+                    exit_px, k_exit = c[k], k
                     break
             if exit_px is None:
-                exit_px = c[k]
+                exit_px, k_exit = c[last], last
             trades.append({"symbol": s, "entry_date": df.index[i + 1].date(),
-                           "setup": "Breakout" if brk[i] else "Pullback", "market": mkt[i],
+                           "exit_date": df.index[k_exit].date(), "days": k_exit - i,
                            "R": round((exit_px - entry - COST * entry) / risk, 2),
                            "return_%": round((exit_px / entry - 1 - COST) * 100, 2)})
-            i = k + 1
+            next_free = k_exit + 1
 
-    print(f"\nData: {nifty.index[0]:%b %Y} to {nifty.index[-1]:%b %Y} | {used} stocks tested")
     res = pd.DataFrame(trades)
     if res.empty:
         print("No trades")
         return
-    print("\n===== OVERALL =====")
-    stats(res, "All signals")
-    print("\n===== BY MARKET CONDITION =====")
-    stats(res[res["market"] == "BULLISH"], "Nifty above 50 EMA & 200 SMA")
-    stats(res[res["market"] == "CAUTION"], "Nifty above 200 SMA only")
-    stats(res[res["market"] == "BEARISH"], "Nifty below 200 SMA")
-    print("\n===== BY SETUP =====")
-    stats(res[res["setup"] == "Breakout"], "Base breakout")
-    stats(res[res["setup"] == "Pullback"], "Pullback to 20 EMA")
+    win = res["R"] > 0
+    loss_sum = -res["R"][~win].sum()
+    print(f"\nData: {nifty.index[0]:%b %Y} to {nifty.index[-1]:%b %Y} | {len(stocks)} stocks\n")
+    print("===== OVERALL =====")
+    print(f"Trades: {len(res)} | Win rate: {win.mean():.1%} | Avg R: {res['R'].mean():+.2f} | "
+          f"Profit factor: {res['R'][win].sum() / loss_sum:.2f}")
+    print(f"Avg return per trade: {res['return_%'].mean():+.2f}% | "
+          f"Avg winner: {res.loc[win, 'return_%'].mean():+.2f}% | "
+          f"Avg loser: {res.loc[~win, 'return_%'].mean():+.2f}% | Avg days held: {res['days'].mean():.1f}")
+    print(f"Biggest winner: {res['return_%'].max():+.1f}% | Biggest loser: {res['return_%'].min():+.1f}%")
     print("\n===== BY YEAR =====")
-    print(res.groupby(pd.to_datetime(res["entry_date"]).dt.year)["R"]
-          .agg(["count", "mean", "sum"]).round(2))
+    yr = res.groupby(pd.to_datetime(res["entry_date"]).dt.year)
+    print(pd.DataFrame({"trades": yr.size(),
+                        "win%": (yr["R"].apply(lambda r: (r > 0).mean() * 100)).round(1),
+                        "avg R": yr["R"].mean().round(2),
+                        "avg return %": yr["return_%"].mean().round(2)}).to_string())
     res.to_csv("backtest_trades.csv", index=False)
 
 
