@@ -1,12 +1,12 @@
 """
-NSE Swing Scanner v5 -> Telegram
+NSE Swing Scanner v6 -> Telegram
 Prices : Angel One SmartAPI (official NSE data)
 M.Cap  : AMFI list (amfi_mcap.pdf in this repository)
 MODE=live : during market hours, alerts new setups as they form (provisional)
 MODE=eod  : full report after market close
 Educational tool, not investment advice.
 """
-import os, re, json, math, time, html, hashlib
+import os, re, json, math, time, html, hashlib, calendar
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -43,6 +43,7 @@ MAX_FETCH_LIVE  = 300    # max history downloads in one live run
 
 AMFI_FILE  = "amfi_mcap.pdf"
 CACHE_FILE = "history.pkl.gz"
+PARSER_VER = 2
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 NIFTY, VIX = "NIFTY50", "INDIAVIX"
 NIFTY_TOKEN, VIX_TOKEN = "99926000", "99926017"
@@ -90,41 +91,100 @@ def save_cache(c):
 
 
 # ===================== AMFI MARKET CAP LIST =====================
-ISIN_RE = re.compile(r"\b(IN[A-Z0-9]{9}\d)\b")
+ISIN_RE = re.compile(r"(IN[A-Z0-9]{9}\d)")
 NUM_RE = re.compile(r"^\d[\d,]*(\.\d+)?$")
-CAT_RE = re.compile(r"(Large|Mid|Small)\s*Cap\s*$", re.I)
+CAT_RE = re.compile(r"(Large|Mid|Small)\s*Cap", re.I)
 SYM_RE = re.compile(r"^[A-Z0-9][A-Z0-9&\-\.]*$")
 
 
 def clean_name(name):
-    name = re.sub(r"[,\.\s]+$", "", name)
+    name = re.sub(r"[,\.\s]+$", "", str(name))
     return re.sub(r"\s+(Ltd|Limited|Ltd\.)$", "", name, flags=re.I).strip()
+
+
+def to_num(s):
+    return float(s.replace(",", ""))
+
+
+def parse_cells(cells):
+    """One table row -> (nse_symbol, name, avg_mcap) or None."""
+    cells = [re.sub(r"\s+", " ", str(c or "")).strip() for c in cells]
+    idx = next((i for i, c in enumerate(cells) if ISIN_RE.fullmatch(c.replace(" ", ""))), None)
+    if idx is None:
+        return None
+    rest = [c.strip("*").strip() for c in cells[idx + 1:]]
+    nums = [c for c in rest if NUM_RE.match(c)]
+    if not nums:
+        return None
+    if len(rest) >= 4 and rest[2] and SYM_RE.match(rest[2]) and not NUM_RE.match(rest[2]):
+        sym = rest[2]                       # NSE symbol column
+    else:
+        syms = [c for c in rest if c and c != "-" and not NUM_RE.match(c) and SYM_RE.match(c)]
+        if not syms:
+            return None
+        sym = syms[1] if len(syms) >= 2 else syms[0]
+    name = cells[idx - 1] if idx >= 1 and cells[idx - 1] else sym
+    return sym, name, to_num(nums[-1])
+
+
+def parse_line(line):
+    """One text line -> (nse_symbol, name, avg_mcap) or None."""
+    mi = ISIN_RE.search(line)
+    if not mi or not CAT_RE.search(line[mi.end():]):
+        return None
+    after = CAT_RE.split(line[mi.end():])[0]
+    tokens = [t.strip("*") for t in after.split()]
+    nums = [t for t in tokens if NUM_RE.match(t)]
+    syms = [t for t in tokens if t and t != "-" and not NUM_RE.match(t) and SYM_RE.match(t)]
+    if not nums or not syms:
+        return None
+    sym = syms[1] if len(syms) >= 2 else syms[0]
+    name = re.sub(r"^\s*\d+\s+", "", line[:mi.start()]).strip() or sym
+    return sym, name, to_num(nums[-1])
 
 
 def parse_amfi(path):
     import pdfplumber
-    rows, period = {}, None
+    found = {"table_lines": {}, "table_text": {}, "text_3": {}, "text_1": {}}
+    period = None
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
-            text = page.extract_text() or ""
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
             if period is None:
                 m = re.search(r"six months ended\s*(\d{1,2}[\s\-]*[A-Za-z]+[\s\-,]*\d{4})", text, re.I)
                 if m:
                     period = m.group(1)
-            for line in text.splitlines():
-                mi = ISIN_RE.search(line)
-                if not mi or not CAT_RE.search(line):
-                    continue
-                after = CAT_RE.sub("", line[mi.end():])
-                tokens = [t.strip("*") for t in after.split()]
-                nums = [t for t in tokens if NUM_RE.match(t)]
-                syms = [t for t in tokens if t and t != "-" and not NUM_RE.match(t) and SYM_RE.match(t)]
-                if not nums or not syms:
-                    continue
-                nse_sym = syms[1] if len(syms) >= 2 else syms[0]
-                name = re.sub(r"^\s*\d+\s+", "", line[:mi.start()]).strip()
-                rows[nse_sym] = {"name": clean_name(name) or nse_sym,
-                                 "mcap": float(nums[-1].replace(",", ""))}
+            table_methods = {
+                "table_lines": lambda: page.extract_tables(),
+                "table_text": lambda: page.extract_tables({"vertical_strategy": "text",
+                                                           "horizontal_strategy": "text"}),
+            }
+            for key, get_tables in table_methods.items():
+                try:
+                    tables = get_tables() or []
+                except Exception:
+                    tables = []
+                for table in tables:
+                    for cells in table:
+                        p = parse_cells(cells)
+                        if p:
+                            found[key][p[0]] = p
+            for key, tol in (("text_3", 3), ("text_1", 1)):
+                try:
+                    t = page.extract_text(x_tolerance=tol) or ""
+                except Exception:
+                    t = ""
+                for line in t.splitlines():
+                    p = parse_line(line)
+                    if p:
+                        found[key][p[0]] = p
+    best = max(found, key=lambda k: len(found[k]))
+    print("AMFI rows found per method:", {k: len(v) for k, v in found.items()}, "-> using", best)
+    rows = {sym: {"name": clean_name(name) or sym, "mcap": mcap}
+            for sym, name, mcap in found[best].values()}
     return rows, period
 
 
@@ -132,11 +192,11 @@ def get_universe(cache):
     with open(AMFI_FILE, "rb") as f:
         md5 = hashlib.md5(f.read()).hexdigest()
     a = cache["amfi"]
-    if a.get("md5") != md5:
-        print("Reading AMFI file...")
+    if a.get("md5") != md5 or a.get("ver") != PARSER_VER:
+        print("Reading AMFI file (takes a few minutes the first time)...")
         rows, period = parse_amfi(AMFI_FILE)
         a.clear()
-        a.update({"md5": md5, "rows": rows, "period": period})
+        a.update({"md5": md5, "ver": PARSER_VER, "rows": rows, "period": period})
     universe = {s: v for s, v in a["rows"].items() if v["mcap"] >= MIN_MCAP_CR}
     return universe, a.get("period")
 
@@ -325,11 +385,18 @@ def news(query, days=3, n=10):
            requests.utils.quote(f"{query} when:{days}d") + "&hl=en-IN&gl=IN&ceid=IN:en")
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        entries = feedparser.parse(resp.content).entries[:n]
+        entries = feedparser.parse(resp.content).entries
     except Exception as e:
         print("News error:", e)
         return 0, []
-    titles = [e.title for e in entries]
+    cutoff = time.time() - days * 86400
+    fresh = []
+    for e in entries:
+        pp = getattr(e, "published_parsed", None)
+        if pp and calendar.timegm(pp) < cutoff:
+            continue                       # skip old articles
+        fresh.append(e)
+    titles = [e.title for e in fresh[:n]]
     score = 0
     for t in titles:
         low = t.lower()
@@ -537,6 +604,9 @@ def run_eod(universe, data, nifty, today, regime, n, vix_now, size_factor,
              f"(50EMA {n.EMA50:,.0f}, 200SMA {n.SMA200:,.0f}) | VIX {vix_now:.1f}",
              f"Scanned {len(universe)} stocks (M.Cap ≥ ₹{MIN_MCAP_CR:,} Cr) | "
              f"{len(hits)} passed chart rules"]
+    if len(universe) < 200:
+        lines.append(f"⚠️ Only {len(universe)} companies were read from {AMFI_FILE}. "
+                     f"The file may be the wrong one or in a new format.")
     if pending:
         lines.append(f"⏳ Price history still loading for {pending} stocks – "
                      f"they'll be included in coming runs.")
@@ -547,7 +617,7 @@ def run_eod(universe, data, nifty, today, regime, n, vix_now, size_factor,
     if size_factor < 1:
         lines.append(f"⚠️ Weak market – position sizes x{size_factor}")
 
-    _, mkt_titles = news("Sensex Nifty stock market", days=1, n=3)
+    _, mkt_titles = news("Sensex Nifty stock market", days=2, n=3)
     if mkt_titles:
         lines.append("\n📰 <b>Market headlines</b>")
         lines += [f"• {html.escape(t)}" for t in mkt_titles]
