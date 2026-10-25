@@ -1,0 +1,36 @@
+name: Backtest
+
+on:
+  workflow_dispatch:          # runs only when you start it
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install tools
+        run: pip install -r requirements.txt
+
+      - name: Load saved price history
+        uses: actions/cache/restore@v4
+        with:
+          path: history.pkl.gz
+          key: hist-${{ github.run_id }}
+          restore-keys: hist-
+
+      - name: Run backtest
+        run: python backtest.py
+
+      - name: Save trade list
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-trades
+          path: backtest_trades.csv
+          if-no-files-found: ignore
